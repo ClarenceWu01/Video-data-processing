@@ -6,8 +6,12 @@ import subprocess
 from pydub import AudioSegment
 import math
 import numpy as np
+from numpy import dot
+from numpy.linalg import norm
 from deepface import DeepFace
 from scipy.spatial.distance import cosine
+
+import find_speaker
 
 '''
 because my directory for ffmpeg is wrong, I manually set the directory in each function.
@@ -121,7 +125,7 @@ def time_str(time):
     hour = str(math.floor(time/3600))
     minute = str(math.floor(time/60)%60)
     second = str(math.floor(time%60))
-    ms = str(time%1 * 1000)
+    ms = str(int(time%1 * 1000))
     while len(hour)<2:
         hour = "0"+hour
     
@@ -134,7 +138,7 @@ def time_str(time):
         ms="0"+ms
 
     
-    return hour+":"+minute+":"+second+":"+ms
+    return hour+":"+minute+":"+second+"."+ms
 
 def cut_video1(video_path, startT, endT):
     ffmpeg_path = "/opt/homebrew/bin/ffmpeg"
@@ -178,7 +182,7 @@ def cut_video1(video_path, startT, endT):
     os.remove(audio_path)
     os.remove(cut_audio_path)
 
-
+'''
 def cut_video(video_path, output_path, startF, endF):
     ffmpeg_path = "/opt/homebrew/bin/ffmpeg"
 
@@ -220,6 +224,25 @@ def cut_video(video_path, output_path, startF, endF):
     os.remove(temp_video_path)
     os.remove(audio_path)
     os.remove(cut_audio_path)
+'''
+#rework version
+def cut_video(video_path, output_path, startF, endF):
+    startC = time_str(startF/25)
+    endC = time_str(endF/25)
+    ffmpeg_path = "/opt/homebrew/bin/ffmpeg"
+    temp_video_path = video_path + '.temp.mp4'
+    command = [
+        ffmpeg_path,
+        '-i', video_path,
+        '-ss', startC,
+        '-to', endC,
+        '-c:v', 'libx264',
+        '-c:a', 'aac',
+        output_path
+    ]
+    subprocess.run(command, check=True)
+
+
 
 def track_face1(video_path, folder_path, new_folder_path):
     # Load the video
@@ -278,23 +301,33 @@ def track_face1(video_path, folder_path, new_folder_path):
 
 def extract(image_path):
     #temp_path = image_path + ".temp.jpg"
-    faces = DeepFace.extract_faces(img_path=image_path)
+    #adjustable value: confidence
+    faces = DeepFace.extract_faces(img_path=image_path, detector_backend = 'retinaface')
     ret = []
-    for face in faces:
+    for i in range(len(faces)):
+        face = faces[i]
+        confidence = face['confidence']
         temp_path = image_path + ".temp.jpg"
         face_array = face['face']
         cv.imwrite(temp_path, face_array)
         facial_area = face['facial_area']
         face_representation = DeepFace.represent(img_path=temp_path, model_name = "ArcFace", enforce_detection=False)
-        ret.append((face_representation, facial_area))
+        #print(face_representation)
+        #testing remove print(face_representation)
+        if(confidence>=0.8 and facial_area['w']>=0 and facial_area['h']>=0):
+            ret.append([face_representation[0]['embedding'], facial_area, 0]) #the final 0 is for the multi-frame determination system only, frames of appearence
+        #the following line is strictly for debugging
         os.remove(temp_path)
+    #the following line is strictly for debugging
     return ret
+
 
 def distance(old, new):
     return math.sqrt((old[0]-new[0])**2 + (old[1]-new[1])**2)
 
-def compare_face(embedding_1, embedding_2):
-    cosine_similarity = 1 - cosine(embedding1, embedding2)
+def compare_face(embedding1, embedding2):
+    #the print statements is for testing
+    cosine_similarity = dot(embedding1, embedding2) / (norm(embedding1) * norm(embedding2))
     return cosine_similarity>=0.6
 
 def track_face2(video_path):
@@ -303,26 +336,7 @@ def track_face2(video_path):
     img_path = video_path+"image.jpg"
 
     #declare status variables for finding speaker
-    speaker_known = False
-
-    old_position = (0, 0)
-    new_position = (0, 0)
-    
-    while not speaker_known:
-        ret, frame = cap.read()
-        if not ret:
-            break
-        
-        
-        gray = cv.cvtColor(frame, cv.COLOR_BGR2GRAY)
-        cv.imwrite(img_path, gray)
-        faces = extract(img_path)
-        if len(faces)==1:
-            face_embedding = faces[0][0]
-            speaker_face = face_embedding
-            speaker_known = True
-            new_position = (faces[0][1][0], faces[0][1][1])
-        os.remove(img_path)
+    speaker_face = find_speaker.find_speaker(video_path) #this should in theory return an embedding
 
     #actul segmenting
     
@@ -334,7 +348,7 @@ def track_face2(video_path):
     old_position = (0, 0)
     new_position = (0, 0)
     frame_num = 0
-
+    print("started cutting")
     while True:
         ret, frame = cap.read()
         if not ret:
@@ -344,14 +358,14 @@ def track_face2(video_path):
         faces = extract(img_path)
         
         if len(faces)==1 and compare_face(faces[0][0], speaker_face) and tracking == False:
-            old_position = (faces[0][1][0], faces[0][1][1])
-            new_position = (faces[0][1][0], faces[0][1][1])
+            old_position = (faces[0][1]['x'], faces[0][1]['y'])
+            new_position = (faces[0][1]['x'], faces[0][1]['y'])
             tracking=True
             startF = frame_num
             endF = frame_num
-        elif len(faces)==1 and compare_faces(faces[0][0], speaker_face) and distance(old_position, new_position)<=300 and tracking==True:
+        elif len(faces)==1 and compare_face(faces[0][0], speaker_face) and distance(old_position, new_position)<=30 and tracking==True:
             old_position = new_position
-            new_position = (faces[0][1][0], faces[0][1][1])
+            new_position = (faces[0][1]['x'], faces[0][1]['y'])
             endF +=1
         else:
             tracking = False
@@ -359,7 +373,7 @@ def track_face2(video_path):
                 cut_video(video_path, video_path+".seg"+str(seg_num)+".mp4", startF, endF)
                 seg_num+=1
         frame_num+=1
-            
+    print("finished cutting") 
             
 
 def track_face(video_path):
@@ -390,13 +404,13 @@ def track_face(video_path):
             face_encodings = face_recognition.face_encodings(rgb_frame, [faces[0]])
             speaker_face = face_encodings[0]
             speaker_known = True
-
+    print("speaker known")
     #actul segmenting
     seg_num = 0
     frame_num=0
     
-    
-    while True:
+    frame_count = cap.get(cv.CAP_PROP_FRAME_COUNT)
+    for i in range(frame_count):
         ret, frame = cap.read()
         if not ret:
             break
@@ -411,11 +425,18 @@ def track_face(video_path):
             endF = frame_num
         elif len(faces)==1 and faces[0]==speaker+face and tracking:
             endF += 1
+        elif i==frame_count--:
+            tracking = False
+            if endF-startF>=10 :
+                cut_video(video_path, video_path+".seg"+str(seg_num)+".mp4", startF, endF)
+                seg_num+=1
         else:
             tracking = False
             if endF-startF>=10 :
                 cut_video(video_path, video_path+".seg"+str(seg_num)+".mp4", startF, endF)
                 seg_num+=1
+    cap.release()
+    print("cutting finished")
 
 
 def match_audio(video_path):
@@ -445,14 +466,14 @@ def cut(video_path, startT, endT):
 
 #define locations in the following 2 lines of code
 #fill in your own directories
-os.chdir("/Users/clarencewu/Downloads")
-folder = "avspeech_part"
+os.chdir("")
+folder = ""
 
 directory = os.getcwd()
 path = os.path.join(directory, folder)
 print(f"Current directory: {directory}")
 print(f"Folder path: {path}")
-
+video_files = get_video_files(path)
 
 '''
 if os.path.isdir(path):
@@ -470,8 +491,6 @@ if os.path.isdir(path):
 else:
     print(f"Folder '{folder}' does not exist in the current directory.")
 '''
-video_files = get_video_files(path)
-print("processing" + video_files[0])
-track_face2(video_files[0])
-print("complete")
-
+#the following codes will be a testing of track face 2
+video = video_files[1]
+track_face2(video)
